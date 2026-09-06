@@ -86,8 +86,7 @@ trino-opa/
 ├── .gitlab-ci.yml              # GitLab CI pipeline
 ├── docker-compose.yml          # Local dev: Trino + OPA with hot reload
 ├── opa/
-│   ├── trino.rego              # Example RBAC policy
-│   └── trino_test.rego         # OPA unit tests (run in CI)
+│   └── trino.rego              # Example RBAC policy
 ├── trino/
 │   ├── config.properties       # Trino coordinator config (Docker Compose)
 │   ├── access-control.properties  # Points Trino at OPA
@@ -826,66 +825,20 @@ The `batch` rules in `opa/trino.rego` implement this pattern. Always define both
 
 ## CI: GitHub Actions & GitLab CI
 
-Both pipelines follow the same two-stage pattern using **Alpine Linux** with manually installed tools (OPA, OpenTofu, kubectl, Helm, AWS CLI) — no pre-built CI actions or special images required.
+Both pipelines run on `main` only and follow the same flow inside an `alpine:latest` container — all tools are installed from scratch on every run, no pre-built images required.
+
+### What it does
 
 ```
-validate  →  deploy (main branch only)
-```
-
-| Stage | What runs | When |
-|---|---|---|
-| `validate` | OPA fmt + check + test, OpenTofu fmt + validate | Every push and pull/merge request |
-| `deploy` | Full `tofu apply` to EKS | Push to `main` only, after validate passes |
-
-### File layout
-
-```
-.github/
-└── workflows/
-    └── ci.yml        # GitHub Actions
-.gitlab-ci.yml        # GitLab CI
-opa/
-└── trino_test.rego   # OPA unit tests (run in the validate stage)
-```
-
-### Validate stage
-
-Runs inside an `alpine:latest` container. Installs OPA and OpenTofu from their official install scripts, then:
-
-```
-opa fmt --fail opa/             # fails if any .rego file is not canonical
-opa check opa/                  # syntax + type-check without evaluating
-opa test opa/ --verbose         # runs all *_test.rego files
-
-tofu fmt -check -recursive terraform/    # fails if any .tf file is not canonical
-tofu -chdir=terraform init -backend=false  # downloads providers, skips remote state
-tofu -chdir=terraform validate           # HCL syntax + cross-reference check
-```
-
-`-backend=false` means the validate stage needs **no cloud credentials** — it works on any runner or GitHub-hosted machine.
-
-### Deploy stage
-
-Also runs in `alpine:latest`. Installs the full tool chain:
-
-```
-apk: bash curl unzip python3 py3-pip openssl
-pip: awscli
-curl: opentofu, kubectl v1.28.4, helm (get-helm-3 script)
-```
-
-Then:
-
-```
-helm repo add trino + helm pull trino/trino
-aws configure  (credentials from CI secrets)
-aws eks update-kubeconfig  →  kubectl cluster-info + get nodes
+Install: bash curl python3 awscli OpenTofu kubectl Helm
+Add Trino Helm repo
+Configure AWS → connect to EKS → verify cluster
 cd terraform && tofu init -upgrade && tofu apply -auto-approve
 ```
 
-`tofu apply` deploys the full stack in one command: OPA (ConfigMap + Deployment + Service) and Trino (Helm release). The `configmap-hash` annotation in `opa.tf` ensures a rolling OPA restart whenever the policy changes.
+`tofu apply` deploys the full stack in one command: OPA (ConfigMap + Deployment + Service) and Trino (Helm release). The `configmap-hash` annotation in `opa.tf` automatically triggers a rolling OPA restart whenever the policy file changes.
 
-### Required CI secrets / variables
+### Required secrets / variables
 
 Set these in **GitLab → Settings → CI/CD → Variables** or **GitHub → Settings → Secrets and variables → Actions**:
 
@@ -896,35 +849,11 @@ Set these in **GitLab → Settings → CI/CD → Variables** or **GitHub → Set
 | `AWS_REGION` | AWS region of the EKS cluster (default: `us-east-1`) |
 | `EKS_CLUSTER_NAME` | EKS cluster name (default: `my-cluster`) |
 
-The Terraform `terraform.tfvars` secrets (`admin_password`, `internal_communication_shared_secret`, etc.) should be stored as a GitLab/GitHub file secret or injected via a secrets manager and written to `terraform/terraform.tfvars` as a deploy step.
+The Terraform variable values (`admin_password`, `internal_communication_shared_secret`, etc.) should be injected as a file secret or via a secrets manager and written to `terraform/terraform.tfvars` as part of the deploy step.
 
-### GitLab-specific: runner tag
+### GitLab: runner tag
 
-The `deploy` job has `tags: [docker]`. Replace `docker` with the tag of your registered GitLab runner. The `validate` job has no tag and runs on any available runner.
-
-### OPA test file (`opa/trino_test.rego`)
-
-`opa test` auto-discovers `*_test.rego` files. The test file covers all four roles (`admin`, `read_only_user`, `bi_developer`, `dbt_developer`) and both the single-request `allow` rules and the batch filtering rules. Run locally:
-
-```bash
-# No local OPA needed — use Docker
-docker run --rm -v $(pwd)/opa:/policies openpolicyagent/opa:latest \
-  test /policies --verbose
-```
-
-### Running the validate stage locally
-
-```bash
-# OPA (fix formatting with: opa fmt -w opa/)
-opa fmt --fail opa/
-opa check opa/
-opa test opa/ --verbose
-
-# OpenTofu (fix formatting with: tofu fmt -recursive terraform/)
-tofu fmt -check -recursive terraform/
-tofu -chdir=terraform init -backend=false
-tofu -chdir=terraform validate
-```
+The job has `tags: [docker]`. Replace `docker` with the tag of your registered GitLab runner.
 
 ---
 

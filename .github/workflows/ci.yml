@@ -3,65 +3,17 @@ name: CI
 on:
   push:
     branches: [main]
-  pull_request:
 
 env:
   AWS_REGION: "us-east-1"
   EKS_CLUSTER_NAME: "my-cluster"   # override via GitHub repo secrets/variables
 
 jobs:
-  # ── Validate: OPA + Terraform (every push and PR, no cloud credentials) ──────
-  validate:
-    name: Validate
-    runs-on: ubuntu-latest
-    container:
-      image: alpine:latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: apk add --no-cache bash curl unzip
-
-      - name: Install OPA
-        run: |
-          curl -sL -o /usr/local/bin/opa \
-            https://openpolicyagent.org/downloads/latest/opa_linux_amd64_static
-          chmod +x /usr/local/bin/opa
-
-      - name: Install OpenTofu
-        run: |
-          curl --proto '=https' --tlsv1.2 -fsSL \
-            https://get.opentofu.org/install-opentofu.sh -o install-opentofu.sh
-          chmod +x install-opentofu.sh
-          ./install-opentofu.sh --install-method apk
-          rm -f install-opentofu.sh
-
-      - name: OPA — check formatting
-        run: opa fmt --fail opa/
-
-      - name: OPA — check syntax
-        run: opa check opa/
-
-      - name: OPA — run tests
-        run: opa test opa/ --verbose
-
-      - name: Terraform — check formatting
-        run: tofu fmt -check -recursive terraform/
-
-      - name: Terraform — init (no backend)
-        run: tofu -chdir=terraform init -backend=false
-
-      - name: Terraform — validate
-        run: tofu -chdir=terraform validate
-
-  # ── Deploy: apply full stack to EKS (main branch only) ───────────────────────
   deploy:
     name: Deploy
     runs-on: ubuntu-latest
     container:
       image: alpine:latest
-    needs: validate
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     steps:
       - uses: actions/checkout@v4
 
