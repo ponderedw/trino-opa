@@ -92,11 +92,10 @@ trino-opa/
 │   ├── config.properties       # Trino coordinator config (Docker Compose)
 │   ├── access-control.properties  # Points Trino at OPA
 │   └── catalog/
-│       ├── analytics_prod.properties  # tpch connector (read-only test data)
-│       ├── analytics_stage.properties
-│       ├── reporting.properties
-│       ├── bi_prod.properties
-│       └── sandbox.properties         # memory connector (writable)
+│       ├── powerschool.properties     # tpch connector (Student Information System)
+│       ├── illuminate.properties      # tpch connector (Assessment platform)
+│       ├── bi_prod.properties         # tpch connector (BI production views)
+│       └── sandbox.properties         # memory connector (dbt development, writable)
 ├── kubernetes/
 │   ├── opa-configmap.yaml      # Policy stored as a ConfigMap
 │   ├── opa-deployment.yaml     # OPA Deployment with auto-restart on policy change
@@ -144,35 +143,41 @@ trino --server http://localhost:8080 --user admin
 
 ### 4. Explore the test catalogs
 
-Five catalogs are pre-configured to match the example policy:
+Four catalogs are pre-configured to match the education-domain policy:
 
-| Catalog | Connector | Who can access |
-|---|---|---|
-| `analytics_prod` | `tpch` (read-only, generated data) | `admin`, `read_only_user` |
-| `analytics_stage` | `tpch` | `admin`, `read_only_user` |
-| `reporting` | `tpch` | `admin`, `read_only_user` |
-| `bi_prod` | `tpch` | `admin`, analyst users (`alice`, `bob`, `charlie`) |
-| `sandbox` | `memory` (writable, in-memory) | `admin`, analyst users (full access in `dev_*` schemas) |
+| Catalog | Connector | Description | Who can read |
+|---|---|---|---|
+| `powerschool` | `tpch` (generated data) | Student Information System — enrollment, grades, attendance | `admin`, `read_only_user`, `bi_developer`, `dbt_developer` |
+| `illuminate` | `tpch` (generated data) | Assessment platform — test scores, benchmarks | `admin`, `read_only_user`, `bi_developer`, `dbt_developer` |
+| `bi_prod` | `tpch` (generated data) | BI production views and reports | `admin`, `bi_developer` (+ writes to `dev_*` schemas) |
+| `sandbox` | `memory` (writable, in-memory) | Development area for dbt models | `admin`, `dbt_developer` (+ writes to `dev_*` schemas) |
 
 The `tpch` connector ships built-in with Trino and generates TPC-H benchmark data on the fly — no external database needed. The `memory` connector stores tables in-process; data is lost when Trino restarts, which is fine for testing writes.
 
 ```sql
--- As admin: see all catalogs
+-- As admin: see all four catalogs
 SHOW CATALOGS;
 
--- As read_only_user: only analytics_prod, analytics_stage, reporting visible
+-- As read_only_user: only powerschool and illuminate are visible
 SHOW CATALOGS;
+SELECT * FROM powerschool.tiny.orders LIMIT 10;
+SELECT * FROM illuminate.tiny.orders LIMIT 10;
+INSERT INTO powerschool.tiny.orders ...;   -- ACCESS DENIED
 
--- Query generated tpch data
-SELECT * FROM analytics_prod.tiny.orders LIMIT 10;
+-- As alice (bi_developer): read source data and build reports in bi_prod
+SELECT * FROM powerschool.tiny.orders LIMIT 10;
+SELECT * FROM bi_prod.tiny.orders LIMIT 10;
+CREATE SCHEMA bi_prod.dev_alice;
+CREATE TABLE bi_prod.dev_alice.enrollment_report (id bigint, school varchar);
+INSERT INTO bi_prod.tiny.orders ...;      -- denied — not a dev_ schema
 
--- As alice: create a dev schema and table in the sandbox
-CREATE SCHEMA sandbox.dev_alice;
-CREATE TABLE sandbox.dev_alice.test (id bigint, name varchar);
-INSERT INTO sandbox.dev_alice.test VALUES (1, 'hello');
-
--- As alice: writing to a non-dev schema is denied
-CREATE SCHEMA sandbox.production;  -- ACCESS DENIED
+-- As charlie (dbt_developer): read source data and build models in sandbox
+SELECT * FROM illuminate.tiny.orders LIMIT 10;
+SELECT * FROM bi_prod.tiny.orders LIMIT 10;  -- ACCESS DENIED
+CREATE SCHEMA sandbox.dev_charlie;
+CREATE TABLE sandbox.dev_charlie.stg_students (id bigint, name varchar);
+INSERT INTO sandbox.dev_charlie.stg_students VALUES (1, 'Ada Lovelace');
+INSERT INTO sandbox.production.data ...;  -- denied — not a dev_ schema
 ```
 
 ### 5. Edit a policy — no restart needed
@@ -214,20 +219,10 @@ allow if {
 
 `input` is the JSON object Trino sends to OPA. `input.context.identity.user` is the authenticated username.
 
-### Read-only user
+### read_only_user — school staff
 
 ```rego
-_read_only_catalogs := {"analytics_prod", "analytics_stage", "reporting"}
-
-_read_ops := {
-    "ExecuteQuery", "AccessCatalog", "FilterCatalogs",
-    "ShowSchemas",  "FilterSchemas",
-    "ShowTables",   "FilterTables",
-    "ShowColumns",  "FilterColumns",
-    "SelectFromColumns",
-    "ExecuteFunction", "FilterFunctions",
-    "ExecuteProcedure",
-}
+_read_only_catalogs := {"powerschool", "illuminate"}
 
 allow if {
     input.context.identity.user == "read_only_user"
@@ -236,7 +231,7 @@ allow if {
 }
 ```
 
-All conditions in a rule body must be true for the rule to fire. This reads as: "allow if the user is `read_only_user` AND the operation is a read operation AND the catalog is in the permitted set."
+All conditions in a rule body must be true for the rule to fire. This reads as: "allow if the user is `read_only_user` AND the operation is a read operation AND the catalog is powerschool or illuminate."
 
 ### Browsing without a table resource
 
@@ -250,17 +245,35 @@ allow if {
 }
 ```
 
-### Scoped write access (dev_ schemas)
+### bi_developer — scoped write access in bi_prod
+
+BI developers can read all source and BI catalogs, but can only write inside schemas prefixed with `dev_` in `bi_prod` — their personal workspace for building and testing reports:
 
 ```rego
+_bi_developers    := {"alice", "bob"}
+_bi_read_catalogs := {"powerschool", "illuminate", "bi_prod"}
+
 allow if {
-    input.context.identity.user in _analyst_users
-    input.action.resource.table.catalogName == "sandbox"
+    input.context.identity.user in _bi_developers
+    input.action.resource.table.catalogName == "bi_prod"
     startswith(input.action.resource.table.schemaName, "dev_")
 }
 ```
 
-Analysts can write freely to any schema whose name starts with `dev_` in the `sandbox` catalog. All other write operations are denied.
+### dbt_developer — scoped write access in sandbox
+
+dbt developers read the raw source catalogs and build staging models in their own `dev_*` schemas inside `sandbox`. They have no access to `bi_prod` (that is the BI team's domain):
+
+```rego
+_dbt_developers   := {"charlie", "dave"}
+_dbt_read_catalogs := {"powerschool", "illuminate"}
+
+allow if {
+    input.context.identity.user in _dbt_developers
+    input.action.resource.table.catalogName == "sandbox"
+    startswith(input.action.resource.table.schemaName, "dev_")
+}
+```
 
 ### Inspecting the input object
 
@@ -280,8 +293,8 @@ curl -s -X POST http://localhost:8181/v1/data/trino/allow \
         "operation": "SelectFromColumns",
         "resource": {
           "table": {
-            "catalogName": "bi_prod",
-            "schemaName":  "public",
+            "catalogName": "powerschool",
+            "schemaName":  "tiny",
             "tableName":   "orders"
           }
         }
@@ -315,7 +328,7 @@ test_read_only_user_select_allowed {
         "context": {"identity": {"user": "read_only_user"}},
         "action": {
             "operation": "SelectFromColumns",
-            "resource": {"table": {"catalogName": "analytics_prod", "schemaName": "public", "tableName": "sales"}}
+            "resource": {"table": {"catalogName": "powerschool", "schemaName": "tiny", "tableName": "student"}}
         }
     }
 }
@@ -325,7 +338,7 @@ test_read_only_user_write_denied {
         "context": {"identity": {"user": "read_only_user"}},
         "action": {
             "operation": "InsertIntoTable",
-            "resource": {"table": {"catalogName": "analytics_prod", "schemaName": "public", "tableName": "sales"}}
+            "resource": {"table": {"catalogName": "powerschool", "schemaName": "tiny", "tableName": "student"}}
         }
     }
 }
@@ -782,7 +795,7 @@ When Trino lists catalogs, schemas, or tables, it needs to filter the results to
 
 The batch endpoint collapses this into a single call. OPA receives an array of resources and returns the set of indices that are allowed:
 
-**Request to `/v1/data/trino/batch`:**
+**Request to `/v1/data/trino/batch`:** (as `alice`, a bi_developer)
 ```json
 {
   "input": {
@@ -790,9 +803,10 @@ The batch endpoint collapses this into a single call. OPA receives an array of r
     "action": {
       "operation": "FilterCatalogs",
       "filterResources": [
+        {"catalog": {"name": "powerschool"}},
+        {"catalog": {"name": "illuminate"}},
         {"catalog": {"name": "bi_prod"}},
-        {"catalog": {"name": "analytics_prod"}},
-        {"catalog": {"name": "internal_secrets"}}
+        {"catalog": {"name": "sandbox"}}
       ]
     }
   }
@@ -801,10 +815,10 @@ The batch endpoint collapses this into a single call. OPA receives an array of r
 
 **Response:**
 ```json
-{"result": [0, 1]}
+{"result": [0, 1, 2]}
 ```
 
-Indices 0 and 1 (`bi_prod`, `analytics_prod`) are allowed; index 2 (`internal_secrets`) is not.
+Indices 0, 1, 2 (`powerschool`, `illuminate`, `bi_prod`) are allowed; index 3 (`sandbox`) is not — BI developers cannot read or write the dbt sandbox.
 
 The `batch` rules in `opa/trino.rego` implement this pattern. Always define both `allow` and `batch` rules — `allow` covers single-resource decisions (e.g., `SELECT`) and `batch` covers filtering (e.g., `SHOW TABLES`).
 
@@ -890,7 +904,7 @@ The `deploy` job has `tags: [docker]`. Replace `docker` with the tag of your reg
 
 ### OPA test file (`opa/trino_test.rego`)
 
-`opa test` auto-discovers `*_test.rego` files. The test file covers all three roles (admin, read-only, analyst) and both the single-request `allow` rules and the batch filtering rules. Run locally:
+`opa test` auto-discovers `*_test.rego` files. The test file covers all four roles (`admin`, `read_only_user`, `bi_developer`, `dbt_developer`) and both the single-request `allow` rules and the batch filtering rules. Run locally:
 
 ```bash
 # No local OPA needed — use Docker

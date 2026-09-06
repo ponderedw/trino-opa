@@ -7,23 +7,16 @@ import future.keywords.in
 default allow := false
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Roles
+# Admin
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Admin has unrestricted access to everything.
 allow if {
 	input.context.identity.user == "admin"
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Read-only user
+# Shared helpers
 # ──────────────────────────────────────────────────────────────────────────────
-
-_read_only_catalogs := {
-	"analytics_prod",
-	"analytics_stage",
-	"reporting",
-}
 
 _read_ops := {
 	"ExecuteQuery",
@@ -37,14 +30,19 @@ _read_ops := {
 	"ExecuteProcedure",
 }
 
-# Allow read operations on permitted catalogs.
+# ──────────────────────────────────────────────────────────────────────────────
+# read_only_user — school staff, read access to SIS and assessment data
+# ──────────────────────────────────────────────────────────────────────────────
+
+_read_only_catalogs := {"powerschool", "illuminate"}
+
 allow if {
 	input.context.identity.user == "read_only_user"
 	input.action.operation in _read_ops
 	input.action.resource.table.catalogName in _read_only_catalogs
 }
 
-# Allow catalog/schema browsing when no table resource is attached yet.
+# Allow catalog/schema browsing before a table resource is resolved.
 allow if {
 	input.context.identity.user == "read_only_user"
 	input.action.operation in {"ExecuteQuery", "AccessCatalog", "FilterCatalogs", "ShowSchemas", "FilterSchemas"}
@@ -52,61 +50,85 @@ allow if {
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Analyst users — read access to BI catalogs, write in dev_ sandboxes
+# bi_developer — reads source + BI catalogs, writes to dev_ schemas in bi_prod
 # ──────────────────────────────────────────────────────────────────────────────
 
-_analyst_users := {"alice", "bob", "charlie"}
+_bi_developers := {"alice", "bob"}
 
-_analyst_catalogs := {"bi_prod", "sandbox"}
+_bi_read_catalogs := {"powerschool", "illuminate", "bi_prod"}
 
-_write_ops := {
-	"CreateSchema", "AlterSchema", "DropSchema",
-	"CreateTable", "AlterTable", "DropTable",
-	"InsertIntoTable", "DeleteFromTable", "TruncateTable",
-	"CreateView", "DropView",
-	"CreateMaterializedView", "DropMaterializedView",
-}
-
-# Read access to all analyst catalogs.
 allow if {
-	input.context.identity.user in _analyst_users
+	input.context.identity.user in _bi_developers
 	input.action.operation in _read_ops
-	input.action.resource.table.catalogName in _analyst_catalogs
+	input.action.resource.table.catalogName in _bi_read_catalogs
 }
 
-# Catalog/schema browsing for analysts.
 allow if {
-	input.context.identity.user in _analyst_users
+	input.context.identity.user in _bi_developers
 	input.action.operation in {"ExecuteQuery", "AccessCatalog", "FilterCatalogs", "ShowSchemas", "FilterSchemas"}
 	not input.action.resource.table
 }
 
-# ShowTables sends a schema resource, not a table resource.
 allow if {
-	input.context.identity.user in _analyst_users
+	input.context.identity.user in _bi_developers
 	input.action.operation in {"ShowTables", "FilterTables"}
-	input.action.resource.schema.catalogName in _analyst_catalogs
+	input.action.resource.schema.catalogName in _bi_read_catalogs
 }
 
-# Full write access inside any schema whose name starts with "dev_" in the sandbox catalog.
+# Full write access to dev_ prefixed schemas in bi_prod (building BI models).
 allow if {
-	input.context.identity.user in _analyst_users
+	input.context.identity.user in _bi_developers
+	input.action.resource.table.catalogName == "bi_prod"
+	startswith(input.action.resource.table.schemaName, "dev_")
+}
+
+allow if {
+	input.context.identity.user in _bi_developers
+	input.action.resource.schema.catalogName == "bi_prod"
+	startswith(input.action.resource.schema.schemaName, "dev_")
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# dbt_developer — reads source catalogs, writes to dev_ schemas in sandbox
+# ──────────────────────────────────────────────────────────────────────────────
+
+_dbt_developers := {"charlie", "dave"}
+
+_dbt_read_catalogs := {"powerschool", "illuminate"}
+
+allow if {
+	input.context.identity.user in _dbt_developers
+	input.action.operation in _read_ops
+	input.action.resource.table.catalogName in _dbt_read_catalogs
+}
+
+allow if {
+	input.context.identity.user in _dbt_developers
+	input.action.operation in {"ExecuteQuery", "AccessCatalog", "FilterCatalogs", "ShowSchemas", "FilterSchemas"}
+	not input.action.resource.table
+}
+
+allow if {
+	input.context.identity.user in _dbt_developers
+	input.action.operation in {"ShowTables", "FilterTables"}
+	input.action.resource.schema.catalogName in _dbt_read_catalogs
+}
+
+# Full write access to dev_ prefixed schemas in sandbox (building dbt models).
+allow if {
+	input.context.identity.user in _dbt_developers
 	input.action.resource.table.catalogName == "sandbox"
 	startswith(input.action.resource.table.schemaName, "dev_")
 }
 
 allow if {
-	input.context.identity.user in _analyst_users
+	input.context.identity.user in _dbt_developers
 	input.action.resource.schema.catalogName == "sandbox"
 	startswith(input.action.resource.schema.schemaName, "dev_")
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Batched filter rules (opa.policy.batched-uri)
-#
-# Trino calls the batch endpoint when it needs to filter a list of resources
-# (e.g. listing catalogs, schemas, or tables) in a single OPA call.
-# Each rule adds the *index* of an allowed resource to the `batch` set.
 # ──────────────────────────────────────────────────────────────────────────────
 
 batch contains i if {
@@ -114,6 +136,7 @@ batch contains i if {
 	input.action.filterResources[i]
 }
 
+# read_only_user batch
 batch contains i if {
 	input.context.identity.user == "read_only_user"
 	resource := input.action.filterResources[i]
@@ -127,34 +150,73 @@ batch contains i if {
 }
 
 batch contains i if {
-	input.context.identity.user in _analyst_users
+	input.context.identity.user == "read_only_user"
 	resource := input.action.filterResources[i]
-	resource.catalog.name in _analyst_catalogs
+	resource.table.catalogName in _read_only_catalogs
+}
+
+# bi_developer batch
+batch contains i if {
+	input.context.identity.user in _bi_developers
+	resource := input.action.filterResources[i]
+	resource.catalog.name in _bi_read_catalogs
 }
 
 batch contains i if {
-	input.context.identity.user in _analyst_users
+	input.context.identity.user in _bi_developers
 	resource := input.action.filterResources[i]
-	resource.schema.catalogName in _analyst_catalogs
+	resource.schema.catalogName in _bi_read_catalogs
 }
 
 batch contains i if {
-	input.context.identity.user in _analyst_users
+	input.context.identity.user in _bi_developers
 	resource := input.action.filterResources[i]
-	resource.table.catalogName in _analyst_catalogs
+	resource.table.catalogName in _bi_read_catalogs
 }
 
-# Allow analysts to filter dev_ sandbox schemas/tables.
 batch contains i if {
-	input.context.identity.user in _analyst_users
+	input.context.identity.user in _bi_developers
 	resource := input.action.filterResources[i]
-	resource.table.catalogName == "sandbox"
+	resource.schema.catalogName == "bi_prod"
+	startswith(resource.schema.schemaName, "dev_")
+}
+
+batch contains i if {
+	input.context.identity.user in _bi_developers
+	resource := input.action.filterResources[i]
+	resource.table.catalogName == "bi_prod"
 	startswith(resource.table.schemaName, "dev_")
 }
 
+# dbt_developer batch
 batch contains i if {
-	input.context.identity.user in _analyst_users
+	input.context.identity.user in _dbt_developers
+	resource := input.action.filterResources[i]
+	resource.catalog.name in _dbt_read_catalogs
+}
+
+batch contains i if {
+	input.context.identity.user in _dbt_developers
+	resource := input.action.filterResources[i]
+	resource.schema.catalogName in _dbt_read_catalogs
+}
+
+batch contains i if {
+	input.context.identity.user in _dbt_developers
+	resource := input.action.filterResources[i]
+	resource.table.catalogName in _dbt_read_catalogs
+}
+
+batch contains i if {
+	input.context.identity.user in _dbt_developers
 	resource := input.action.filterResources[i]
 	resource.schema.catalogName == "sandbox"
 	startswith(resource.schema.schemaName, "dev_")
+}
+
+batch contains i if {
+	input.context.identity.user in _dbt_developers
+	resource := input.action.filterResources[i]
+	resource.table.catalogName == "sandbox"
+	startswith(resource.table.schemaName, "dev_")
 }
