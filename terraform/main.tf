@@ -2,6 +2,10 @@ terraform {
   required_version = ">= 1.5"
 
   required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
     kubernetes = {
       source  = "hashicorp/kubernetes"
       version = "~> 2.27"
@@ -9,6 +13,10 @@ terraform {
     helm = {
       source  = "hashicorp/helm"
       version = "~> 2.13"
+    }
+    kubectl = {
+      source  = "gavinbunney/kubectl"
+      version = "~> 1.14"
     }
   }
 
@@ -19,6 +27,10 @@ terraform {
   #   region  = "us-east-1"
   #   encrypt = true
   # }
+}
+
+provider "aws" {
+  region = var.aws_region
 }
 
 # ── Kubernetes provider ───────────────────────────────────────────────────────
@@ -36,6 +48,25 @@ provider "helm" {
     config_path    = var.kubeconfig_path
     config_context = var.kubeconfig_context
   }
+}
+
+provider "kubectl" {
+  config_path    = var.kubeconfig_path
+  config_context = var.kubeconfig_context
+}
+
+# ── External Secrets Operator ─────────────────────────────────────────────────
+# ESO is a cluster-wide operator. Install it once; it handles all ExternalSecret
+# resources across namespaces.
+
+resource "helm_release" "external_secrets_operator" {
+  name             = "external-secrets"
+  repository       = "https://charts.external-secrets.io"
+  chart            = "external-secrets"
+  namespace        = "external-secrets"
+  create_namespace = true
+  version          = "0.9.20"
+  wait             = true
 }
 
 # Option B — AWS EKS:

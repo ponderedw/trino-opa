@@ -17,6 +17,7 @@ A complete guide to deploying [Open Policy Agent (OPA)](https://www.openpolicyag
 9. [Production: Kubernetes](#production-kubernetes)
 10. [Trino Helm Chart Explained](#trino-helm-chart-explained)
 11. [Production: Terraform](#production-terraform)
+    - [Dynamic Catalog System](#dynamic-catalog-system)
 12. [The Batch API](#the-batch-api)
 13. [CI: GitHub Actions & GitLab CI](#ci-github-actions--gitlab-ci)
 14. [Troubleshooting](#troubleshooting)
@@ -670,11 +671,197 @@ The `terraform/` directory manages the full stack — Trino (via Helm) and OPA �
 
 | File | Purpose |
 |---|---|
-| `main.tf` | Kubernetes/Helm provider configuration, namespace resource |
-| `variables.tf` | All tunable inputs — sizing, credentials, ingress, etc. |
+| `main.tf` | AWS, Kubernetes, Helm, and kubectl provider configuration; namespace; ESO Helm release |
+| `variables.tf` | Non-sensitive inputs — sizing, cluster config, ingress |
+| `secrets.tf` | Fetches sensitive values from AWS Secrets Manager |
 | `trino.tf` | `helm_release` for Trino, wired to `helm-values.yml` |
-| `helm-values.yml` | Helm values template, rendered with Terraform's `templatefile()` |
+| `helm-values.yml` | Helm values template — includes init containers, sidecar, and volumes |
 | `opa.tf` | OPA `ConfigMap`, `Deployment`, and `Service` |
+| `trino-dynamic-catalogs.tf` | Catalog templates ConfigMap, refresher script ConfigMap, ESO SecretStore + ExternalSecret |
+| `trino-rbac.tf` | Kubernetes Role + RoleBinding granting the Trino ServiceAccount permission to PATCH Deployments |
+| `catalog_refresher.py` | Python script — runs as init container (renders templates) and as sidecar (watches for changes, triggers restarts) |
+
+### AWS Secrets Manager
+
+All sensitive values (`admin_password`, `internal_communication_shared_secret`, user credentials) are stored as a single JSON object in one Secrets Manager secret. This keeps them out of `terraform.tfvars`, CI environment variables, and version control entirely.
+
+**1. Create the secret (once)**
+
+```bash
+aws secretsmanager create-secret \
+  --name terraform-trino \
+  --region us-east-1 \
+  --secret-string '{
+    "admin_password":                      "$2y$10$...",
+    "internal_communication_shared_secret": "'"$(openssl rand -hex 32)"'",
+    "extra_users": [
+      "alice:$2y$10$...",
+      "charlie:$2y$10$..."
+    ]
+  }'
+```
+
+Generate bcrypt hashes with:
+```bash
+htpasswd -bnBC 10 '' mypassword | tr -d ':'
+```
+
+**2. How Terraform reads it**
+
+`secrets.tf` fetches the secret and decodes the JSON into a local map:
+
+```hcl
+data "aws_secretsmanager_secret_version" "trino" {
+  secret_id = var.secret_name   # default: "terraform-trino"
+}
+
+locals {
+  secrets = jsondecode(data.aws_secretsmanager_secret_version.trino.secret_string)
+
+  password_auth = join("\n", concat(
+    ["admin:${local.secrets["admin_password"]}"],
+    try(local.secrets["extra_users"], []),
+  ))
+}
+```
+
+Other files reference values as `local.secrets["key"]` — the secret never touches disk or a tfvars file.
+
+**3. Update credentials**
+
+```bash
+aws secretsmanager put-secret-value \
+  --secret-id terraform-trino \
+  --secret-string file://secrets.json
+```
+
+Then run `terraform apply`. Terraform re-reads the secret on every plan/apply, recomputes `sha256(secret_string)`, and if it changed, updates the `secrets-hash` pod annotation on both the coordinator and worker. Kubernetes detects the changed pod template and performs a rolling restart automatically — the same pattern used for OPA policy updates via `configmap-hash`.
+
+```hcl
+# secrets.tf
+locals {
+  secrets_hash = sha256(data.aws_secretsmanager_secret_version.trino.secret_string)
+}
+
+# helm-values.yml (coordinator + worker)
+annotations:
+  secrets-hash: "${secrets_hash}"
+```
+
+### Dynamic Catalog System
+
+Static catalogs baked into the Helm chart create a chicken-and-egg problem: credentials live in Secrets Manager, but the Helm values file can't read them directly. The dynamic catalog system solves this with three layers that work together.
+
+#### Layer 1 — External Secrets Operator (ESO)
+
+ESO is a Kubernetes operator that watches `ExternalSecret` CRDs and syncs values from AWS Secrets Manager into ordinary Kubernetes Secrets. Terraform installs ESO as a Helm release, then creates:
+
+- A `SecretStore` that tells ESO how to authenticate with Secrets Manager in your region.
+- An `ExternalSecret` that syncs all keys from the `terraform-trino` secret into a Kubernetes Secret named `trino-credentials`, refreshing every minute.
+
+When you rotate a database password in Secrets Manager, ESO propagates the new value into the Kubernetes Secret within 60 seconds — no Terraform run required.
+
+```
+AWS Secrets Manager  →(1 min)→  trino-credentials (K8s Secret)
+```
+
+#### Layer 2 — Init container
+
+Every coordinator and worker pod runs a `catalog-init` init container _before_ the Trino process starts. It:
+
+1. Reads all credential files from `/etc/trino/credentials` (the mounted `trino-credentials` secret).
+2. Reads all `.properties.tmpl` files from `/etc/trino/catalog-templates` (a ConfigMap).
+3. Substitutes `{placeholder}` variables in each template with matching credential values.
+4. Writes the rendered `.properties` files to `/etc/trino/catalog` (a shared `emptyDir` volume).
+5. Exits — Trino then starts with the populated catalog directory.
+
+Templates that reference a missing credential are skipped with a warning, so a single bad credential doesn't block all catalogs.
+
+```
+trino-catalog-templates (ConfigMap)  →(render)→  /etc/trino/catalog (emptyDir)
+trino-credentials (Secret)           ↗
+```
+
+#### Layer 3 — Catalog refresher sidecar
+
+A long-running sidecar container (`catalog-refresher`) runs alongside the coordinator. Every 30 seconds it:
+
+1. Hashes the current credentials and templates.
+2. Compares with the previous hash.
+3. If changed: waits until the cluster has zero running queries, then PATCHes the coordinator and worker Deployments to add a `restartedAt` annotation — triggering a rolling restart.
+
+The rolling restart causes the init container to re-run with the new credentials, so every pod picks up the rotated credentials within minutes, with zero downtime.
+
+```
+trino-credentials changes → sidecar detects hash diff
+                          → waits for idle cluster
+                          → K8s PATCH Deployment → rolling restart
+                          → init container re-runs → fresh catalog files
+```
+
+The sidecar needs permission to PATCH Deployments. Terraform creates a `Role` + `RoleBinding` that grants this to the `trino` ServiceAccount (created by Helm).
+
+#### Catalog templates
+
+Templates live in `terraform/trino-dynamic-catalogs.tf` under `locals.catalog_templates`. Each key is the filename; `{placeholder}` variables are replaced by keys in the Secrets Manager secret.
+
+```
+# terraform-trino secret must contain:
+{
+  "powerschool_url":      "jdbc:postgresql://host:5432/powerschool",
+  "powerschool_user":     "trino_reader",
+  "powerschool_password": "...",
+  "illuminate_url":       "jdbc:postgresql://host:5432/illuminate",
+  ...
+  "admin_password_plain": "plaintext-for-query-drain-check"
+}
+```
+
+`admin_password_plain` is the only special key — the refresher sidecar uses it to call the Trino `/v1/query` REST endpoint to check for running queries before restarting. All other keys are catalog-specific and map directly to template placeholders.
+
+#### Adding a new catalog
+
+1. Add a key block to `locals.catalog_templates` in `trino-dynamic-catalogs.tf`:
+
+```hcl
+"my_catalog.properties.tmpl" = <<-EOT
+  connector.name=postgresql
+  connection-url={my_catalog_url}
+  connection-user={my_catalog_user}
+  connection-password={my_catalog_password}
+  postgresql.fetch-size=10000
+EOT
+```
+
+2. Add the matching keys to the Secrets Manager secret:
+
+```bash
+# Add alongside existing keys — fetch, merge, put
+aws secretsmanager get-secret-value --secret-id terraform-trino \
+  --query SecretString --output text | jq '. + {
+    "my_catalog_url":      "jdbc:postgresql://host:5432/db",
+    "my_catalog_user":     "reader",
+    "my_catalog_password": "secret"
+  }' > /tmp/updated.json
+
+aws secretsmanager put-secret-value \
+  --secret-id terraform-trino \
+  --secret-string file:///tmp/updated.json
+```
+
+3. Run `terraform apply` to update the ConfigMap. The sidecar detects the template change and triggers a rolling restart automatically — no manual pod restarts needed.
+
+#### Secrets Manager key reference
+
+| Key | Used by | Purpose |
+|-----|---------|---------|
+| `admin_password` | Terraform → Helm `passwordAuth` | Bcrypt-hashed password for the `admin` Trino user |
+| `internal_communication_shared_secret` | Terraform → Helm `additionalConfigProperties` | Coordinator↔worker auth token |
+| `extra_users` | Terraform → Helm `passwordAuth` | Additional `user:bcrypt` entries |
+| `admin_password_plain` | Refresher sidecar | Plaintext password for Trino REST API (query drain check) |
+| `<catalog>_url` | Init container template rendering | JDBC URL for each catalog |
+| `<catalog>_user` | Init container template rendering | Database username |
+| `<catalog>_password` | Init container template rendering | Database password |
 
 ### First deploy
 
@@ -685,26 +872,16 @@ helm repo add trino https://trinodb.github.io/charts
 helm repo update
 ```
 
-**2. Create a `terraform.tfvars` file**
+**2. Create a `terraform.tfvars` file** (non-sensitive values only)
 
 ```hcl
 # terraform/terraform.tfvars
 
-namespace = "trino"
+namespace   = "trino"
+aws_region  = "us-east-1"
+secret_name = "terraform-trino"   # name of the Secrets Manager secret
 
-# Generate: htpasswd -bnBC 10 '' mypassword | tr -d ':'
-admin_password = "$2y$10$..."
-
-# Add more users as "username:bcrypt-hash" strings
-extra_users = [
-  "alice:$2y$10$...",
-  "bob:$2y$10$...",
-]
-
-# Generate: openssl rand -hex 32
-internal_communication_shared_secret = "abc123..."
-
-# Sizing (these defaults are suitable for a small cluster)
+# Sizing
 coordinator_workers = 2
 coordinator_heap    = "8G"
 coordinator_memory  = "10Gi"
@@ -716,7 +893,7 @@ worker_cpu          = "3"
 # Expose Trino externally (optional)
 ingress_enabled = true
 trino_hostname  = "trino.example.com"
-tls_secret_name = "trino-tls"   # name of an existing TLS Secret, or ""
+tls_secret_name = "trino-tls"
 ```
 
 **3. Initialize and apply**
@@ -728,9 +905,13 @@ terraform apply
 ```
 
 Terraform will:
-1. Create the `trino` namespace.
-2. Deploy OPA (ConfigMap + Deployment + Service).
-3. Deploy Trino via Helm, waiting for OPA's Service to exist first.
+1. Fetch secrets from AWS Secrets Manager.
+2. Create the `trino` namespace.
+3. Install External Secrets Operator (cluster-wide Helm release).
+4. Create catalog template and refresher script ConfigMaps.
+5. Create the ESO SecretStore + ExternalSecret (which triggers the first sync of credentials into `trino-credentials`).
+6. Deploy OPA (ConfigMap + Deployment + Service).
+7. Deploy Trino via Helm — pods start the `catalog-init` init container, then Trino, then the `catalog-refresher` sidecar.
 
 ### Connecting to a different cluster
 
@@ -849,7 +1030,7 @@ Set these in **GitLab → Settings → CI/CD → Variables** or **GitHub → Set
 | `AWS_REGION` | AWS region of the EKS cluster (default: `us-east-1`) |
 | `EKS_CLUSTER_NAME` | EKS cluster name (default: `my-cluster`) |
 
-The Terraform variable values (`admin_password`, `internal_communication_shared_secret`, etc.) should be injected as a file secret or via a secrets manager and written to `terraform/terraform.tfvars` as part of the deploy step.
+All sensitive values (`admin_password`, `internal_communication_shared_secret`, user credentials) are stored in AWS Secrets Manager and fetched automatically by `secrets.tf` at plan/apply time — nothing sensitive needs to be passed as a CI variable or written to a file.
 
 ### GitLab: runner tag
 

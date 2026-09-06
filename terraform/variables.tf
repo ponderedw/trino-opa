@@ -28,19 +28,18 @@ variable "trino_image_tag" {
   default     = "481"
 }
 
-# ── Authentication ────────────────────────────────────────────────────────────
+# ── AWS ──────────────────────────────────────────────────────────────────────
 
-variable "admin_password" {
-  description = "Bcrypt-hashed password for the admin user. Generate with: htpasswd -bnBC 10 '' mypassword | tr -d ':'."
+variable "aws_region" {
+  description = "AWS region used for the Secrets Manager data source and (optionally) EKS auth."
   type        = string
-  sensitive   = true
+  default     = "us-east-1"
 }
 
-variable "extra_users" {
-  description = "Additional username:bcrypt-hash pairs for password auth, one per list item."
-  type        = list(string)
-  default     = []
-  sensitive   = true
+variable "secret_name" {
+  description = "Name or ARN of the AWS Secrets Manager secret that holds all sensitive values."
+  type        = string
+  default     = "terraform-trino"
 }
 
 # ── Sizing: coordinator ───────────────────────────────────────────────────────
@@ -139,10 +138,3 @@ variable "tls_secret_name" {
   default     = ""
 }
 
-# ── Internal communication ────────────────────────────────────────────────────
-
-variable "internal_communication_shared_secret" {
-  description = "Shared secret for internal Trino coordinator ↔ worker communication. Generate with: openssl rand -hex 32."
-  type        = string
-  sensitive   = true
-}

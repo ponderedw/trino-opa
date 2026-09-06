@@ -1,12 +1,3 @@
-locals {
-  # Build the htpasswd-format string: "user:hash\nuser2:hash2\n..."
-  # The leading "admin:" entry is always present; extra_users appends more.
-  password_auth = join("\n", concat(
-    ["admin:${var.admin_password}"],
-    var.extra_users,
-  ))
-}
-
 resource "helm_release" "trino" {
   name       = "trino"
   repository = "https://trinodb.github.io/charts"
@@ -24,14 +15,20 @@ resource "helm_release" "trino" {
 
   # OPA must be running before Trino starts so the access-control plugin
   # can reach it on the first request.
+  # ESO + catalog ConfigMaps must exist before pods start so the init
+  # container can render catalog files during pod startup.
   depends_on = [
     kubernetes_namespace_v1.trino,
     kubernetes_service_v1.opa,
+    helm_release.external_secrets_operator,
+    kubernetes_config_map_v1.catalog_templates,
+    kubernetes_config_map_v1.catalog_refresher,
+    kubectl_manifest.external_secret,
   ]
 
   values = [
     templatefile("${path.module}/helm-values.yml", {
-      internal_communication_shared_secret = var.internal_communication_shared_secret
+      internal_communication_shared_secret = local.secrets["internal_communication_shared_secret"]
       trino_image_tag                      = var.trino_image_tag
       workers                              = var.coordinator_workers
       coordinator_heap                     = var.coordinator_heap
@@ -46,6 +43,7 @@ resource "helm_release" "trino" {
       worker_max_memory_per_node           = var.worker_max_memory_per_node
       worker_heap_headroom                 = var.worker_heap_headroom
       password_auth                        = local.password_auth
+      secrets_hash                         = local.secrets_hash
       ingress_enabled                      = var.ingress_enabled
       trino_hostname                       = var.trino_hostname
       tls_secret_name                      = var.tls_secret_name
