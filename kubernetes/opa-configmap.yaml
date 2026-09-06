@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trino-opa-policies
+  namespace: trino
+data:
+  trino.rego: |
+    package trino
+
+    import future.keywords.if
+    import future.keywords.in
+
+    default allow := false
+
+    allow if {
+        input.context.identity.user == "admin"
+    }
+
+    # Add your rules here — see opa/trino.rego in this repo for a full example.

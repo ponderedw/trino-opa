@@ -1,0 +1,166 @@
+image:
+  repository: trinodb/trino
+  tag: "${trino_image_tag}"
+  pullPolicy: IfNotPresent
+
+server:
+  workers: ${workers}
+  node:
+    environment: production
+    dataDir: /data/trino
+    pluginDir: /usr/lib/trino/plugin
+  log:
+    trino:
+      level: INFO
+  config:
+    https:
+      enabled: false
+    authenticationType: "PASSWORD"
+    query:
+      maxMemory: "${coordinator_max_memory}"
+
+additionalConfigProperties:
+  - internal-communication.shared-secret=${internal_communication_shared_secret}
+  - http-server.process-forwarded=true
+
+# ── Authentication ─────────────────────────────────────────────────────────────
+# Passwords must be bcrypt-hashed. Generate a hash:
+#   htpasswd -bnBC 10 '' mypassword | tr -d ':'
+#
+# The Terraform variable `password_auth` is built from var.admin_password
+# and var.extra_users in trino.tf.
+auth:
+  passwordAuth: "${password_auth}"
+
+# ── Access control → OPA ───────────────────────────────────────────────────────
+# The coordinator calls OPA for every authorization decision.
+# Workers do not need access-control.properties because authorization
+# is enforced only on the coordinator.
+coordinator:
+  jvm:
+    maxHeapSize: "${coordinator_heap}"
+    gcMethod:
+      type: "UseG1GC"
+      g1:
+        heapRegionSize: "32M"
+
+  config:
+    memory:
+      heapHeadroomPerNode: "${coordinator_heap_headroom}"
+    query:
+      maxMemoryPerNode: "${coordinator_max_memory_per_node}"
+
+  resources:
+    requests:
+      memory: "${coordinator_memory}"
+      cpu: "${coordinator_cpu}"
+    limits:
+      memory: "${coordinator_memory}"
+      cpu: "${coordinator_cpu}"
+
+  readinessProbe:
+    initialDelaySeconds: 45
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 6
+    successThreshold: 1
+
+  terminationGracePeriodSeconds: 30
+
+  # Injects access-control.properties into /etc/trino/ on the coordinator pod.
+  additionalConfigFiles:
+    access-control.properties: |
+      access-control.name=opa
+      opa.policy.uri=http://trino-opa:8181/v1/data/trino/allow
+      opa.policy.batched-uri=http://trino-opa:8181/v1/data/trino/batch
+
+  deployment:
+    strategy:
+      type: RollingUpdate
+      rollingUpdate:
+        maxSurge: 25%
+        maxUnavailable: 25%
+
+worker:
+  jvm:
+    maxHeapSize: "${worker_heap}"
+    gcMethod:
+      type: "UseG1GC"
+      g1:
+        heapRegionSize: "32M"
+
+  config:
+    memory:
+      heapHeadroomPerNode: "${worker_heap_headroom}"
+    query:
+      maxMemoryPerNode: "${worker_max_memory_per_node}"
+
+  resources:
+    requests:
+      memory: "${worker_memory}"
+      cpu: "${worker_cpu}"
+    limits:
+      memory: "${worker_memory}"
+      cpu: "${worker_cpu}"
+
+  gracefulShutdown:
+    enabled: true
+    gracePeriodSeconds: 120
+
+  terminationGracePeriodSeconds: 240
+
+  deployment:
+    strategy:
+      type: RollingUpdate
+      rollingUpdate:
+        maxSurge: 25%
+        maxUnavailable: 25%
+
+# ── Service ────────────────────────────────────────────────────────────────────
+service:
+  type: ClusterIP
+  port: 8080
+
+# ── Ingress ────────────────────────────────────────────────────────────────────
+# Disabled by default. Set var.ingress_enabled = true and provide
+# var.trino_hostname to expose Trino externally.
+#
+# The example below uses a plain nginx ingress class.
+# For AWS ALB, replace the annotations with:
+#   kubernetes.io/ingress.class: "alb"
+#   alb.ingress.kubernetes.io/scheme: "internet-facing"  # or "internal"
+#   alb.ingress.kubernetes.io/target-type: "ip"
+#   alb.ingress.kubernetes.io/certificate-arn: "<your-acm-arn>"
+#   alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+ingress:
+  enabled: ${ingress_enabled}
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+  hosts:
+    - host: "${trino_hostname}"
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: %{ if tls_secret_name != "" ~}
+    - secretName: "${tls_secret_name}"
+      hosts:
+        - "${trino_hostname}"
+  %{ else ~}[]
+  %{ endif ~}
+
+# ── Security ───────────────────────────────────────────────────────────────────
+securityContext:
+  runAsUser: 1000
+  runAsGroup: 1000
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+serviceAccount:
+  create: true
+
+networkPolicy:
+  enabled: false

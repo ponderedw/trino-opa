@@ -1,0 +1,30 @@
+services:
+  opa:
+    image: openpolicyagent/opa:latest
+    container_name: opa
+    # --addr binds to all interfaces so other containers can reach OPA.
+    # --watch reloads policy files automatically when they change on disk.
+    command: ["run", "--server", "--watch", "--addr=0.0.0.0:8181", "--log-level=info", "/policies"]
+    ports:
+      - "8181:8181"
+    volumes:
+      - "./opa:/policies"
+    networks:
+      - trino-net
+
+  trino:
+    image: trinodb/trino
+    container_name: trino
+    ports:
+      - "8080:8080"
+    depends_on:
+      - opa
+    volumes:
+      - "./trino/config.properties:/etc/trino/config.properties"
+      - "./trino/access-control.properties:/etc/trino/access-control.properties"
+      - "./trino/catalog:/etc/trino/catalog"
+    networks:
+      - trino-net
+
+networks:
+  trino-net:

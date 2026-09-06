@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trino-opa
+  namespace: trino
+  labels:
+    app: trino-opa
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trino-opa
+  template:
+    metadata:
+      labels:
+        app: trino-opa
+      annotations:
+        # Changing this annotation triggers a rolling restart.
+        # Set it to the SHA256 of your ConfigMap data to get automatic
+        # restarts when the policy changes (see the Terraform example for
+        # how to compute this automatically).
+        configmap-hash: "REPLACE_WITH_SHA256_OF_CONFIGMAP"
+    spec:
+      containers:
+        - name: opa
+          image: openpolicyagent/opa:latest
+          args:
+            - run
+            - --server
+            - --addr=0.0.0.0:8181
+            - --log-format=json
+            - --log-level=info
+            - /policies/trino.rego
+          ports:
+            - containerPort: 8181
+          volumeMounts:
+            # subPath mounts the file directly, avoiding symlink indirection
+            # from Kubernetes' ..data/ directory that can cause OPA to see
+            # duplicate package definitions.
+            - name: policies
+              mountPath: /policies/trino.rego
+              subPath: trino.rego
+              readOnly: true
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8181
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health?plugins
+              port: 8181
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: policies
+          configMap:
+            name: trino-opa-policies

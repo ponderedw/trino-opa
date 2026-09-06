@@ -1,0 +1,85 @@
+stages:
+  - validate
+  - deploy
+
+variables:
+  AWS_REGION: "us-east-1"
+  EKS_CLUSTER_NAME: "my-cluster"  # override in GitLab CI/CD → Variables
+
+# ── Validate: OPA + Terraform (runs on every branch, no cloud credentials) ────
+
+validate:
+  stage: validate
+  image: alpine:latest
+  script:
+    - apk add --no-cache bash curl unzip
+
+    # Install OPA
+    - curl -sL -o /usr/local/bin/opa
+        https://openpolicyagent.org/downloads/latest/opa_linux_amd64_static
+    - chmod +x /usr/local/bin/opa
+
+    # Install OpenTofu
+    - curl --proto '=https' --tlsv1.2 -fsSL https://get.opentofu.org/install-opentofu.sh -o install-opentofu.sh
+    - chmod +x install-opentofu.sh
+    - ./install-opentofu.sh --install-method apk
+    - rm -f install-opentofu.sh
+
+    # OPA checks
+    - opa fmt --fail opa/
+    - opa check opa/
+    - opa test opa/ --verbose
+
+    # Terraform checks (-backend=false skips remote state, no credentials needed)
+    - tofu fmt -check -recursive terraform/
+    - tofu -chdir=terraform init -backend=false
+    - tofu -chdir=terraform validate
+
+# ── Deploy: applies the full stack to EKS (main branch only) ─────────────────
+
+deploy:
+  stage: deploy
+  image: alpine:latest
+  tags:
+    - docker  # replace with your GitLab runner tag
+  only:
+    - main
+  script:
+    # Install dependencies
+    - apk add --no-cache bash curl unzip python3 py3-pip openssl
+    - pip3 install awscli --break-system-packages
+
+    # Install OpenTofu
+    - curl --proto '=https' --tlsv1.2 -fsSL https://get.opentofu.org/install-opentofu.sh -o install-opentofu.sh
+    - chmod +x install-opentofu.sh
+    - ./install-opentofu.sh --install-method apk
+    - rm -f install-opentofu.sh
+
+    # Install kubectl
+    - curl -LO "https://dl.k8s.io/release/v1.28.4/bin/linux/amd64/kubectl"
+    - chmod +x kubectl && mv kubectl /usr/local/bin/
+
+    # Install Helm
+    - curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+    - chmod 700 get_helm.sh
+    - VERIFY_CHECKSUM=true ./get_helm.sh
+
+    - helm repo add trino https://trinodb.github.io/charts
+    - helm repo update
+    - helm pull trino/trino
+
+    # Configure AWS and connect to EKS
+    - aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+    - aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+    - aws configure set default.region $AWS_REGION
+    - aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER_NAME
+
+    # Test connectivity
+    - echo "Testing EKS cluster connectivity..."
+    - kubectl cluster-info
+    - kubectl get nodes --request-timeout=30s
+
+    # Deploy
+    - cd terraform
+    - tofu init -upgrade
+    - tofu apply -auto-approve

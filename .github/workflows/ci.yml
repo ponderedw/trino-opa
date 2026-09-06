@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  AWS_REGION: "us-east-1"
+  EKS_CLUSTER_NAME: "my-cluster"   # override via GitHub repo secrets/variables
+
+jobs:
+  # ── Validate: OPA + Terraform (every push and PR, no cloud credentials) ──────
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    container:
+      image: alpine:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: apk add --no-cache bash curl unzip
+
+      - name: Install OPA
+        run: |
+          curl -sL -o /usr/local/bin/opa \
+            https://openpolicyagent.org/downloads/latest/opa_linux_amd64_static
+          chmod +x /usr/local/bin/opa
+
+      - name: Install OpenTofu
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            https://get.opentofu.org/install-opentofu.sh -o install-opentofu.sh
+          chmod +x install-opentofu.sh
+          ./install-opentofu.sh --install-method apk
+          rm -f install-opentofu.sh
+
+      - name: OPA — check formatting
+        run: opa fmt --fail opa/
+
+      - name: OPA — check syntax
+        run: opa check opa/
+
+      - name: OPA — run tests
+        run: opa test opa/ --verbose
+
+      - name: Terraform — check formatting
+        run: tofu fmt -check -recursive terraform/
+
+      - name: Terraform — init (no backend)
+        run: tofu -chdir=terraform init -backend=false
+
+      - name: Terraform — validate
+        run: tofu -chdir=terraform validate
+
+  # ── Deploy: apply full stack to EKS (main branch only) ───────────────────────
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    container:
+      image: alpine:latest
+    needs: validate
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: apk add --no-cache bash curl unzip python3 py3-pip openssl
+
+      - name: Install AWS CLI
+        run: pip3 install awscli --break-system-packages
+
+      - name: Install OpenTofu
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            https://get.opentofu.org/install-opentofu.sh -o install-opentofu.sh
+          chmod +x install-opentofu.sh
+          ./install-opentofu.sh --install-method apk
+          rm -f install-opentofu.sh
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/v1.28.4/bin/linux/amd64/kubectl"
+          chmod +x kubectl && mv kubectl /usr/local/bin/
+
+      - name: Install Helm
+        run: |
+          curl -fsSL -o get_helm.sh \
+            https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+          chmod 700 get_helm.sh
+          VERIFY_CHECKSUM=true ./get_helm.sh
+
+      - name: Add Trino Helm repo
+        run: |
+          helm repo add trino https://trinodb.github.io/charts
+          helm repo update
+          helm pull trino/trino
+
+      - name: Configure AWS and connect to EKS
+        run: |
+          aws configure set aws_access_key_id ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws configure set aws_secret_access_key ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws configure set default.region $AWS_REGION
+          aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER_NAME
+
+      - name: Test EKS connectivity
+        run: |
+          echo "Testing EKS cluster connectivity..."
+          kubectl cluster-info
+          kubectl get nodes --request-timeout=30s
+
+      - name: Deploy
+        run: |
+          cd terraform
+          tofu init -upgrade
+          tofu apply -auto-approve
